@@ -1,10 +1,16 @@
 name: Release
 
-# 打 tag（v1.2.3）即自动出包并发布 Release；也可以在 Actions 页手动跑一次只出产物。
+# 打 tag（v1.2.3）即自动出包并发布 Release；手动运行时可用 platform 指定只构建某一平台。
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      platform:
+        description: "只构建指定平台：all / android / desktop"
+        required: false
+        default: "all"
+        type: string
 
 concurrency:
   group: release-${{ github.ref }}
@@ -16,6 +22,7 @@ env:
 jobs:
   # ================= Windows：NSIS 安装包 + 便携包 =================
   windows:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'desktop' }}
     name: Windows (setup + portable)
     runs-on: windows-latest
     steps:
@@ -73,6 +80,7 @@ jobs:
 
   # ================= Android：按 ABI 分包 + 签名 =================
   android:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'android' }}
     name: Android (split per ABI)
     runs-on: ubuntu-latest
     steps:
@@ -90,41 +98,21 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           node -e "const fs=require('fs');for(const p of ['src-tauri/tauri.conf.json','package.json']){const j=JSON.parse(fs.readFileSync(p));j.version=process.argv[1];fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')}" "$V"
 
-      # secrets 上下文不能直接用于 if，先经 env 转成 step output
-      - name: 检查 Android 签名配置
-        id: keycheck
-        env:
-          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
-          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: |
-          if [[ -z "$KEYSTORE_BASE64" || -z "$KEY_ALIAS" || -z "$STORE_PASSWORD" || -z "$KEY_PASSWORD" ]]; then
-            echo "::warning::未配置完整的 ANDROID_KEY_* secrets，跳过 Android 分包；桌面端 Release 不受影响。"
-            echo "has_key=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_key=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: pnpm/action-setup@v4
-        if: steps.keycheck.outputs.has_key == 'true'
         with:
           version: 10
       - uses: actions/setup-node@v4
-        if: steps.keycheck.outputs.has_key == 'true'
         with:
           node-version: 22
           cache: pnpm
 
       - uses: actions/setup-java@v4
-        if: steps.keycheck.outputs.has_key == 'true'
         with:
           distribution: temurin
           java-version: "17"
 
       # ubuntu runner 自带 Android SDK，不再用 android-actions/setup-android（它的 license 交互会卡住）
       - name: 准备 Android SDK / NDK
-        if: steps.keycheck.outputs.has_key == 'true'
         run: |
           SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
@@ -136,28 +124,22 @@ jobs:
           ls "$SDK/ndk"
 
       - uses: dtolnay/rust-toolchain@stable
-        if: steps.keycheck.outputs.has_key == 'true'
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
       - uses: swatinem/rust-cache@v2
-        if: steps.keycheck.outputs.has_key == 'true'
         with:
           workspaces: src-tauri -> target
           key: android
 
       - run: pnpm install --frozen-lockfile
-        if: steps.keycheck.outputs.has_key == 'true'
 
       - name: 生成 Android 工程
-        if: steps.keycheck.outputs.has_key == 'true'
         run: pnpm tauri android init --ci
 
       - name: 编译 APK（按 ABI 分包）
-        if: steps.keycheck.outputs.has_key == 'true'
         run: pnpm tauri android build --apk --split-per-abi --target aarch64 armv7 x86_64
 
-      - name: 签名 APK
-        if: steps.keycheck.outputs.has_key == 'true'
+      - name: 签名 APK（正式密钥 / 临时自签回退）
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
@@ -166,11 +148,19 @@ jobs:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          if [ -z "${KEYSTORE_BASE64:-}" ]; then
-            echo "::error::缺少 ANDROID_KEY_BASE64 secret，无法签名"; exit 1
-          fi
           KS="$RUNNER_TEMP/release.keystore"
-          echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
+            ALIAS="$KEY_ALIAS"; SP="$STORE_PASSWORD"; KP="$KEY_PASSWORD"
+            echo "使用仓库配置的正式签名密钥"
+          else
+            echo "::warning::未配置 ANDROID_KEY_* secrets，改用本次构建生成的临时密钥自签；正式发版请配置 Secrets。"
+            keytool -genkeypair -v -keystore "$KS" -alias hghub \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass hghub-temp -keypass hghub-temp \
+              -dname "CN=HGhub, OU=OpenSource, O=HGhub, L=NA, S=NA, C=CN"
+            ALIAS="hghub"; SP="hghub-temp"; KP="hghub-temp"
+          fi
           BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
           APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
           mkdir -p artifacts
@@ -179,8 +169,8 @@ jobs:
             abi="$(basename "$(dirname "$(dirname "$f")")")"
             out="artifacts/HGhub_${VERSION}_${abi}.apk"
             "$APKSIGNER" sign \
-              --ks "$KS" --ks-key-alias "$KEY_ALIAS" \
-              --ks-pass "pass:$STORE_PASSWORD" --key-pass "pass:$KEY_PASSWORD" \
+              --ks "$KS" --ks-key-alias "$ALIAS" \
+              --ks-pass "pass:$SP" --key-pass "pass:$KP" \
               --v4-signing-enabled false \
               --out "$out" "$f"
             "$APKSIGNER" verify --print-certs "$out" | head -3
@@ -191,7 +181,6 @@ jobs:
           ls -lh artifacts
 
       - uses: actions/upload-artifact@v4
-        if: steps.keycheck.outputs.has_key == 'true'
         with:
           name: android
           path: artifacts/*
@@ -199,6 +188,7 @@ jobs:
 
   # ================= macOS：Universal（Apple Silicon + Intel）dmg =================
   macos:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'desktop' }}
     name: macOS (universal dmg)
     runs-on: macos-latest
     steps:
