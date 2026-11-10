@@ -90,21 +90,41 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           node -e "const fs=require('fs');for(const p of ['src-tauri/tauri.conf.json','package.json']){const j=JSON.parse(fs.readFileSync(p));j.version=process.argv[1];fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')}" "$V"
 
+      # secrets 上下文不能直接用于 if，先经 env 转成 step output
+      - name: 检查 Android 签名配置
+        id: keycheck
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -z "$KEYSTORE_BASE64" || -z "$KEY_ALIAS" || -z "$STORE_PASSWORD" || -z "$KEY_PASSWORD" ]]; then
+            echo "::warning::未配置完整的 ANDROID_KEY_* secrets，跳过 Android 分包；桌面端 Release 不受影响。"
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: pnpm/action-setup@v4
+        if: steps.keycheck.outputs.has_key == 'true'
         with:
           version: 10
       - uses: actions/setup-node@v4
+        if: steps.keycheck.outputs.has_key == 'true'
         with:
           node-version: 22
           cache: pnpm
 
       - uses: actions/setup-java@v4
+        if: steps.keycheck.outputs.has_key == 'true'
         with:
           distribution: temurin
           java-version: "17"
 
       # ubuntu runner 自带 Android SDK，不再用 android-actions/setup-android（它的 license 交互会卡住）
       - name: 准备 Android SDK / NDK
+        if: steps.keycheck.outputs.has_key == 'true'
         run: |
           SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
@@ -116,22 +136,28 @@ jobs:
           ls "$SDK/ndk"
 
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.keycheck.outputs.has_key == 'true'
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
       - uses: swatinem/rust-cache@v2
+        if: steps.keycheck.outputs.has_key == 'true'
         with:
           workspaces: src-tauri -> target
           key: android
 
       - run: pnpm install --frozen-lockfile
+        if: steps.keycheck.outputs.has_key == 'true'
 
       - name: 生成 Android 工程
+        if: steps.keycheck.outputs.has_key == 'true'
         run: pnpm tauri android init --ci
 
       - name: 编译 APK（按 ABI 分包）
+        if: steps.keycheck.outputs.has_key == 'true'
         run: pnpm tauri android build --apk --split-per-abi --target aarch64 armv7 x86_64
 
       - name: 签名 APK
+        if: steps.keycheck.outputs.has_key == 'true'
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
@@ -165,6 +191,7 @@ jobs:
           ls -lh artifacts
 
       - uses: actions/upload-artifact@v4
+        if: steps.keycheck.outputs.has_key == 'true'
         with:
           name: android
           path: artifacts/*
@@ -229,7 +256,8 @@ jobs:
   release:
     name: Publish GitHub Release
     needs: [windows, android, macos]
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Android 缺密钥时跳过，桌面端产物仍应正常发布
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && needs.windows.result == 'success' && needs.macos.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
